@@ -12,6 +12,7 @@
     "@mediapipe/tasks-vision": "^1.0.1",
     "@supabase/supabase-js": "^2.112.3",
     "@vitejs/plugin-react": "latest",
+    "@xyflow/react": "^12.11.3",
     "lucide-react": "latest",
     "mammoth": "^1.12.1",
     "pdfjs-dist": "^6.2.108",

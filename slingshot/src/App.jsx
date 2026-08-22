@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState, useCallback, useRef } from 'react'
 import {
   Activity, ArrowUpRight, Bell, BriefcaseBusiness, CalendarDays, Check, ChevronRight,
-  CircleHelp, Code2, FileText, GitBranch, Home, LineChart, Lock, Menu, MessageSquare,
+  BookOpen, CircleHelp, Code2, FileText, GitBranch, Home, LineChart, Lock, Menu, MessageSquare,
   Plus, Search, Settings, Sparkles, Target, TrendingUp, Upload, Users, Video, X, Zap,
   Loader2, LogOut
 } from 'lucide-react'
@@ -10,10 +10,15 @@ import LoginPage from './pages/LoginPage'
 import { parseResume } from './lib/resumeParser'
 import { generateSkillAssessment, learningResourceFor } from './lib/assessment'
 import { evaluateMockAnswer, generateMockInterview } from './lib/interview'
+import { scoreCompanyReadiness } from './lib/readiness'
+import { generateCareerRoadmap } from './lib/roadmap'
+import { analyzeReadiness } from './lib/readinessAnalysis'
+import { askTars } from './lib/tars'
 import { FaceLandmarker, FilesetResolver } from '@mediapipe/tasks-vision'
+import { fetchGithubAnalytics, githubUsername } from './lib/github'
 
 const NAV = [
-  ['Overview', Home], ['Readiness', Target], ['Skills', Code2], ['Roadmap', FileText],
+  ['Overview', Home], ['Readiness', Target], ['Skills', Code2], ['Roadmap', FileText], ['Resources', BookOpen],
   ['Companies', BriefcaseBusiness], ['Applications', FileText], ['Interviews', Video], ['Analytics', LineChart],
 ]
 const SKILLS = [
@@ -28,9 +33,7 @@ const TASKS=[
   {id:3,title:'Build system design notes',due:'Aug 28',impact:'+5 readiness',done:false},
   {id:4,title:'Verify Node.js skill',due:'Aug 30',impact:'+4 readiness',done:false},
 ]
-const COMPANIES=[
-  {name:'Microsoft',role:'Software Engineer',match:86,missing:['DSA','System Design']},{name:'Razorpay',role:'Frontend Engineer',match:92,missing:['Testing']},{name:'Google',role:'SWE Intern',match:78,missing:['Advanced DSA','System Design']},{name:'Zoho',role:'Product Engineer',match:74,missing:['DSA','Aptitude']}
-]
+
 const APPLICATIONS=[
   {company:'Microsoft',role:'Software Engineer',stage:'Interview',date:'Aug 18'},{company:'Razorpay',role:'Frontend Engineer',stage:'Screening',date:'Aug 15'},{company:'Google',role:'SWE Intern',stage:'Applied',date:'Aug 10'},{company:'Zoho',role:'Product Engineer',stage:'Rejected',date:'Aug 02'}
 ]
@@ -51,6 +54,11 @@ const buildProfileAnalysis = (form, results = {}) => {
 }
 function Card({children,className=''}){return <section className={`card ${className}`}>{children}</section>}
 function Eyebrow({children}){return <div className="eyebrow">{children}</div>}
+function TarsChat({profile,section,skills}){
+ const [open,setOpen]=useState(false),[input,setInput]=useState(''),[messages,setMessages]=useState([{role:'assistant',content:'Hi, I’m TARS. Ask me about your resume, skills, roadmap, interviews, projects, or any career doubt.'}]),[sending,setSending]=useState(false)
+ const send=async event=>{event?.preventDefault();const question=input.trim();if(!question||sending)return;const nextMessages=[...messages,{role:'user',content:question}];setMessages(nextMessages);setInput('');setSending(true);try{const reply=await askTars(question,{profile:profile?.form||{},current_section:section,skills:(skills||[]).map(skill=>({name:skill.name,status:skill.status,score:skill.score}))},nextMessages.slice(-6));setMessages(current=>[...current,{role:'assistant',content:reply}])}catch(error){setMessages(current=>[...current,{role:'assistant',content:`I couldn’t reach my reasoning service. ${error.message}`}])}finally{setSending(false)}}
+ return <div className={`tars ${open?'open':''}`}>{open&&<section className="tars-panel"><header><div><span><Sparkles size={14}/></span><div><b>TARS</b><small>Career copilot</small></div></div><button className="icon-btn" onClick={()=>setOpen(false)} aria-label="Close TARS"><X size={17}/></button></header><div className="tars-messages">{messages.map((message,index)=><div className={`tars-message ${message.role}`} key={`${message.role}-${index}`}>{message.content}</div>)}{sending&&<div className="tars-message assistant typing">TARS is thinking…</div>}</div><form onSubmit={send}><textarea value={input} onChange={event=>setInput(event.target.value)} placeholder="Ask TARS anything…" rows="2" onKeyDown={event=>{if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();send()}}}/><button className="primary-btn" disabled={!input.trim()||sending} type="submit">Send <ArrowUpRight size={14}/></button></form></section>}<button className="tars-launch" onClick={()=>setOpen(value=>!value)} aria-label="Open TARS"><MessageSquare size={19}/><span>TARS</span></button></div>
+}
 function Landing({onComplete, initialProfile=null, onCancel}){
  const [resume,setResume]=useState(null)
  const [form,setForm]=useState(()=>initialProfile?.form || EMPTY_FORM)
@@ -164,6 +172,31 @@ function App(){
  const [profile,setProfile]=useState(null)
  const [section,setSection]=useState('Overview'); const [skills,setSkills]=useState([]); const [tasks,setTasks]=useState([]); const [apps,setApps]=useState(APPLICATIONS); const [search,setSearch]=useState(''); const [showNav,setShowNav]=useState(false)
  const [quiz,setQuiz]=useState(null); const [quizLoading,setQuizLoading]=useState(false); const [quizError,setQuizError]=useState('')
+
+ // --- Company matches (single source of truth; no duplicate declarations) ---
+ const [companyMatches, setCompanyMatches] = useState([])
+ const [companyLoading, setCompanyLoading] = useState(false)
+ const [companyError, setCompanyError] = useState('')
+
+ const generateCompanyMatches = useCallback(async () => {
+   if (!profile?.form) return
+   setCompanyLoading(true)
+   setCompanyError('')
+   try {
+     setCompanyMatches(await scoreCompanyReadiness(profile.form))
+   } catch (err) {
+     console.error(err)
+     setCompanyError(err.message || 'Could not load company matches. Please try again.')
+     setCompanyMatches([])
+   } finally {
+     setCompanyLoading(false)
+   }
+ }, [profile])
+
+ useEffect(() => {
+   if (profile) generateCompanyMatches()
+ }, [profile, generateCompanyMatches])
+
  const storageKey = user ? `slingshot-profile-${user.id}` : null
  useEffect(()=>{
    // Auth changes must never inherit the previous user's in-memory CDC state.
@@ -174,11 +207,7 @@ function App(){
    try { const savedProfile = JSON.parse(saved); setProfile(savedProfile); setOnboarded(true) } catch { window.localStorage.removeItem(storageKey) }
  },[storageKey])
  const analysis=useMemo(()=>buildProfileAnalysis(profile?.form || EMPTY_FORM, profile?.skillResults),[profile])
- useEffect(()=>{
-   if (!profile) return
-   setSkills(analysis.skills)
-   setTasks(analysis.tasks)
- },[profile,analysis])
+
  const verified=skills.filter(s=>s.status==='Verified').length; const score=Math.min(96,analysis.readiness+verified*2); const missing=skills.filter(s=>s.status!=='Verified').slice(0,3)
  const filtered=useMemo(()=>skills.filter(s=>`${s.name} ${s.cat}`.toLowerCase().includes(search.toLowerCase())),[skills,search])
  const startVerification=async skill=>{
@@ -193,6 +222,7 @@ function App(){
    const nextProfile={...profile,skillResults:{...profile.skillResults,[quiz.skill.name]:{status:passed?'Verified':'Needs practice',score}}}
    setProfile(nextProfile); window.localStorage.setItem(storageKey,JSON.stringify(nextProfile)); setQuiz(current=>({...current,submitted:true,score,passed}))
  }
+
  const toggle=id=>setTasks(p=>p.map(t=>t.id===id?{...t,done:!t.done}:t))
  const stage=(i,v)=>setApps(p=>p.map((a,n)=>n===i?{...a,stage:v}:a))
  // Auth loading state
@@ -222,17 +252,28 @@ function App(){
       <div className="command-head"><div><div className="breadcrumb">Workspace <ChevronRight size={12}/> {section}</div><h1>{title}</h1><p>{section==='Overview' ? `${profile?.form?.role || 'Your target role'} profile, gaps, active applications and next actions in one live workspace.` : 'Career intelligence built around your current resume and target role.'}</p></div><div className="head-actions"><button className="ghost-btn" onClick={()=>setOnboarded(false)}><Upload size={14}/> Update resume</button><button className="primary-btn" onClick={()=>setSection('Skills')}><Zap size={14}/> Verify skill</button></div></div>
       {quizError&&<div className="parse-toast parse-toast--error">{quizError}</div>}
       {section==='Overview'&&<Overview score={score} missing={missing} tasks={tasks} apps={apps} setSection={setSection} role={profile?.form?.role} skills={skills}/>} 
-      {section==='Readiness'&&<Readiness score={score}/>} 
+      {section==='Readiness'&&<Readiness score={score} profile={profile}/>} 
       {section==='Skills'&&<Skills skills={filtered} search={search} setSearch={setSearch} verify={startVerification} loading={quizLoading}/>} 
-      {section==='Roadmap'&&<Roadmap tasks={tasks} toggle={toggle}/>} 
-      {section==='Companies'&&<Companies setSection={setSection} role={profile?.form?.role} skills={skills}/>} 
+      {section==='Roadmap'&&<Roadmap profile={profile?.form}/>} 
+      {section==='Resources'&&<Resources/>}
+      {section==='Companies'&&
+  <Companies
+    setSection={setSection}
+    role={profile?.form?.role}
+    skills={skills}
+    matches={companyMatches}
+    loading={companyLoading}
+    error={companyError}
+    onRetry={generateCompanyMatches}
+  />
+}
       {section==='Applications'&&<Applications apps={apps} stage={stage}/>} 
       {section==='Interviews'&&<Interviews profile={profile?.form}/>} 
-      {section==='Analytics'&&<Analytics/>}
+      {section==='Analytics'&&<Analytics profile={profile?.form}/>} 
       {quiz&&<SkillQuiz quiz={quiz} setQuiz={setQuiz} onFinish={finishQuiz} onClose={()=>setQuiz(null)}/>}
     </div>
    </main>
-
+   <TarsChat profile={profile} section={section} skills={skills}/>
  </div>
 }
 function Overview({score,missing,tasks,apps,setSection,role,skills}){const verified=skills.filter(skill=>skill.status==='Verified').length; return <>
@@ -249,11 +290,110 @@ function Overview({score,missing,tasks,apps,setSection,role,skills}){const verif
  </>}
 function Metric({label,value,suffix}){return <div className="metric"><span>{label}</span><b>{value}<small>{suffix}</small></b></div>}
 function Pipeline({n,label}){return <div className="pipeline-item"><b>{n}</b><span>{label}</span></div>}
-function Readiness({score}){return <div className="content-grid"><Card className="large-card"><div className="readiness-dashboard"><div className="big-ring" style={{'--score':score}}><div><b>{score}%</b><small>overall</small></div></div><div><Eyebrow>READINESS MODEL</Eyebrow><h2>Four signals shape your career readiness.</h2><p>Every verified skill, roadmap completion and interview outcome feeds the Career Twin.</p>{Object.entries(READINESS).map(([k,v])=><div className="pillar" key={k}><span>{k}</span><div><i style={{width:`${v}%`}}/></div><b>{v}%</b></div>)}</div></div></Card><Card><Eyebrow>WHAT MOVES THIS NEXT</Eyebrow>{['Verify DSA','Complete aptitude set','Practice system design'].map((x,i)=><div className="priority" key={x}><span>{i+1}</span><div><strong>{x}</strong><small>Estimated impact +{4-i}% readiness</small></div><ChevronRight size={14}/></div>)}</Card></div>}
+function Readiness({score,profile}){const [analysis,setAnalysis]=useState(null),[error,setError]=useState(''); const activity=useMemo(()=>({roadmap_progress:{phases_completed:0,phases_total:0,tracks:{DSA:{problems_solved:0,target:0,topics_weak:[]},CN:{completion_pct:0},OS:{completion_pct:0},'System Design':{completion_pct:0},Fullstack:{completion_pct:0},Aptitude:{completion_pct:0}}},skill_verification:{quizzes_taken:Object.entries(profile?.skillResults||{}).map(([topic,result])=>({topic,score_pct:result.score,date:new Date().toISOString().slice(0,10)})),coding_tests_taken:[]},mock_interviews:[],target_role:profile?.form?.role||'Software Engineer',time_remaining_weeks:24}),[profile]);useEffect(()=>{let active=true;analyzeReadiness(activity).then(value=>active&&setAnalysis(value)).catch(err=>active&&setError(err.message));return()=>{active=false}},[activity]);const displayScore=analysis?.overall_readiness_pct??score;return <div className="content-grid"><Card className="large-card"><div className="readiness-dashboard"><div className="big-ring" style={{'--score':displayScore}}><div><b>{displayScore}%</b><small>overall</small></div></div><div><Eyebrow>ACTIVITY-BASED READINESS</Eyebrow><h2>{analysis?`Confidence: ${analysis.confidence}`:'Analyzing your recorded activity…'}</h2><p>{error||'This score uses your saved quiz, roadmap and mock-interview activity—not resume claims.'}</p>{(analysis?.tracks||Object.entries(READINESS).map(([name,completion_pct])=>({name,completion_pct,verified_score_pct:null,status:'not started'}))).map(track=><div className="pillar" key={track.name}><span>{track.name}</span><div><i style={{width:`${track.completion_pct}%`}}/></div><b>{track.verified_score_pct===null?'—':`${track.verified_score_pct}%`}</b></div>)}</div></div></Card><Card><Eyebrow>BEFORE YOUR NEXT INTERVIEW</Eyebrow>{(analysis?.next_actions||['Complete a skill quiz to establish a verified baseline.','Finish a roadmap phase to record progress.','Take a mock interview for a real interview-performance signal.']).map((action,index)=><div className="priority" key={action}><span>{index+1}</span><div><strong>{action}</strong></div><ChevronRight size={14}/></div>)}</Card></div>}
 function Skills({skills,search,setSearch,verify,loading}){return <Card><div className="toolbar"><div><Eyebrow>SKILL GRAPH</Eyebrow><h2>Verify each claimed skill with a tailored assessment.</h2></div><div className="search"><Search size={14}/><input value={search} onChange={e=>setSearch(e.target.value)} placeholder="Search skills"/></div></div><div className="skill-table">{skills.map(s=><div className="skill-row" key={s.name}><div><strong>{s.name}</strong><small>{s.cat}</small></div><span className={`status ${s.status.toLowerCase().replace(/\s+/g,'-')}`}>{s.status}</span><div className="skill-bar"><i style={{width:`${s.score||0}%`}}/></div><b>{s.score!==null?`${s.score}%`:'—'}</b>{s.status!=='Verified'&&<button className="verify-btn" disabled={loading} onClick={()=>verify(s)}>{loading?'Preparing…':s.status==='Needs practice'?'Retry quiz':'Verify'}</button>}</div>)}</div></Card>}
 function SkillQuiz({quiz,setQuiz,onFinish,onClose}){const resource=learningResourceFor(quiz.skill.name); const unanswered=quiz.questions.some(question=>!quiz.answers[question.id]); return <div className="modal-backdrop"><section className="modal quiz-modal"><div className="quiz-header"><div><Eyebrow>SKILL ASSESSMENT</Eyebrow><h2>{quiz.skill.name} verification</h2><p>{quiz.questions.length} questions · Pass at 70%</p></div><button className="icon-btn" onClick={onClose}><X size={18}/></button></div>{quiz.questions.map((question,index)=><div className="quiz-question" key={question.id}><div className="quiz-question-head"><span>{index+1}</span><div><small>{question.difficulty} · {question.topic}</small><strong>{question.question}</strong></div></div><div className="quiz-options">{Object.entries(question.options).map(([key,value])=>{const checked=quiz.answers[question.id]===key; const answerClass=quiz.submitted?(key===question.correct_answer?'correct':checked?'incorrect':''):''; return <label className={`quiz-option ${answerClass}`} key={key}><input type="radio" name={`question-${question.id}`} checked={checked} disabled={quiz.submitted} onChange={()=>setQuiz(current=>({...current,answers:{...current.answers,[question.id]:key}}))}/><span>{key}</span>{value}</label>})}</div>{quiz.submitted&&<p className="quiz-explanation">{question.explanation}</p>}</div>)}{quiz.submitted?<div className={`quiz-result ${quiz.passed?'pass':'fail'}`}><strong>{quiz.passed?`Verified — ${quiz.score}%`:`Not verified — ${quiz.score}%`}</strong><p>{quiz.passed?'This skill is now reflected as verified throughout your CDC.':<>Review <a href={resource.url} target="_blank" rel="noreferrer">{resource.label}</a>, then retake this assessment when you are ready.</>}</p><button className="primary-btn" onClick={onClose}>Back to skills</button></div>:<div className="quiz-footer"><span>{unanswered?'Answer every question to submit.':'Ready to submit your assessment.'}</span><button className="primary-btn" disabled={unanswered} onClick={onFinish}>Submit assessment <ArrowUpRight size={14}/></button></div>}</section></div>}
-function Roadmap({tasks,toggle}){return <div className="content-grid"><Card className="large-card"><div className="card-head"><div><Eyebrow>SKILL GAP ENGINE</Eyebrow><h2>Four-week path to close your biggest gaps.</h2></div><span className="status-chip purple"><Sparkles size={12}/> Auto-generated</span></div><div className="roadmap-line">{tasks.map((t,i)=><div className={`roadmap-task ${t.done?'done':''}`} key={t.id}><button onClick={()=>toggle(t.id)} className="check">{t.done&&<Check size={13}/>}</button><div className="week">W{i+1}</div><div><strong>{t.title}</strong><small>{t.due} · {t.impact}</small></div><ChevronRight size={14}/></div>)}</div></Card><Card><Eyebrow>PROGRESS</Eyebrow><div className="progress-number">{tasks.filter(t=>t.done).length}<small> / {tasks.length}</small></div><p>weeks/tasks currently on track.</p><div className="mini-bar"><span style={{width:`${tasks.filter(t=>t.done).length/tasks.length*100}%`}}/></div></Card></div>}
-function Companies({setSection,role,skills}){const have=skills.map(s=>s.name).slice(0,3); return <Card><div className="card-head"><div><Eyebrow>COMPANY MATCH</Eyebrow><h2>Where your profile is strongest.</h2></div><span className="status-chip blue"><Target size={12}/> Skill gap engine</span></div><div className="company-grid">{COMPANIES.map(c=>{const missing=c.missing.filter(item=>!skills.some(skill=>skill.name.toLowerCase().includes(item.toLowerCase()))); const match=Math.min(96,Math.max(55,c.match+(skills.length-3)*2-missing.length*2)); return <div className="company-card" key={c.name}><div className="company-head"><div className="company-logo">{c.name[0]}</div><div><strong>{c.name}</strong><small>{role || c.role}</small></div><b>{match}%</b></div><div className="matchbar"><i style={{width:`${match}%`}}/></div><div className="have-missing"><div><small>You have</small><span>{have.join(' · ') || 'Add skills in your profile'}</span></div><div><small>Missing</small><span className="missing">{missing.join(' · ') || 'No priority gaps'}</span></div></div><button className="text-btn" onClick={()=>setSection(match>=85?'Applications':'Roadmap')}>{match>=85?'Apply flow':'Close skill gap'} <ArrowUpRight size={13}/></button></div>})}</div></Card>}
+function Roadmap({profile}){
+ const [form,setForm]=useState(()=>({current_skills:profile?.skills||'',current_level:profile?.experience||'Student / Fresher',target_role:profile?.role||'',time_available:'6 months'})); const [roadmap,setRoadmap]=useState(null); const [loading,setLoading]=useState(false); const [error,setError]=useState(''); const [selectedId,setSelectedId]=useState(null)
+ const update=(key,value)=>setForm(current=>({...current,[key]:value}))
+ const generate=async event=>{event.preventDefault();setLoading(true);setError('');try{const next=await generateCareerRoadmap(form);setRoadmap(next);setSelectedId(next.phases[0]?.id||null)}catch(err){setError(err.message)}finally{setLoading(false)}}
+ if(!roadmap)return <Card className="roadmap-builder"><div className="card-head"><div><Eyebrow>AI ROADMAP GENERATOR</Eyebrow><h2>Build your Big Tech interview plan</h2><p>Turn your profile and available time into a practical, phase-based plan.</p></div><span className="status-chip purple"><Sparkles size={12}/> Personalized</span></div>{error&&<div className="parse-toast parse-toast--error">{error}</div>}<form className="roadmap-form" onSubmit={generate}><label><span>Current skills</span><textarea required value={form.current_skills} onChange={event=>update('current_skills',event.target.value)} placeholder="Python, React, SQL…"/></label><label><span>Current level</span><select value={form.current_level} onChange={event=>update('current_level',event.target.value)}><option>Student / Fresher</option><option>1–3 years</option><option>3+ years</option></select></label><label><span>Target role</span><input required value={form.target_role} onChange={event=>update('target_role',event.target.value)} placeholder="SDE-1, Backend Engineer…"/></label><label><span>Time available</span><select value={form.time_available} onChange={event=>update('time_available',event.target.value)}><option>8 weeks</option><option>3 months</option><option>6 months</option><option>1 year</option></select></label><button className="primary-btn" disabled={loading} type="submit"><Sparkles size={14}/>{loading?'Generating roadmap…':'Generate roadmap'}</button></form></Card>
+ const selected=roadmap.phases.find(phase=>phase.id===selectedId)||roadmap.phases[0]
+ return <><Card className="roadmap-summary"><div><Eyebrow>PERSONALIZED ROADMAP</Eyebrow><h2>{roadmap.target_role} · {roadmap.total_duration_weeks} weeks</h2><p>Choose a phase to see its measurable study plan. General learning links live in Resources.</p></div><button className="ghost-btn" onClick={()=>setRoadmap(null)}>Create another</button></Card><div className="roadmap-reader"><nav className="roadmap-phase-list">{roadmap.phases.map((phase,index)=><button key={phase.id} className={phase.id===selected?.id?'active':''} onClick={()=>setSelectedId(phase.id)}><span>PHASE {index+1} · {phase.duration_weeks} WKS</span><b>{phase.title}</b></button>)}</nav>{selected&&<Card className="roadmap-detail"><Eyebrow>{selected.id.toUpperCase()}</Eyebrow><h2>{selected.title}</h2><p className="roadmap-milestone">Milestone: {selected.milestone}</p>{selected.tracks.map(track=><article className="roadmap-track" key={track.name}><div><b>{track.name}</b>{track.leetcode_target!==null&&<span>{track.leetcode_target} LeetCode problems</span>}</div><ul>{track.goals.map(goal=><li key={goal}>{goal}</li>)}</ul><small>{track.resources.join(' · ')}</small></article>)}</Card>}</div></>
+}
+function Companies({ matches, loading, error, onRetry, setSection }) {
+
+  if (loading) {
+    return (
+      <Card>
+        <h2>Generating company matches…</h2>
+      </Card>
+    )
+  }
+
+  if (error) {
+    return (
+      <Card>
+        <Eyebrow>AI COMPANY MATCHES</Eyebrow>
+        <h2>Something went wrong</h2>
+        <p>{error}</p>
+        <button className="primary-btn" onClick={onRetry}>Retry</button>
+      </Card>
+    )
+  }
+
+  if (!matches || matches.length === 0) {
+    return (
+      <Card>
+        <Eyebrow>AI COMPANY MATCHES</Eyebrow>
+        <h2>No company matches yet</h2>
+        <p>Complete your profile to see AI-ranked company matches.</p>
+      </Card>
+    )
+  }
+
+  return (
+    <Card>
+      <div className="card-head">
+        <div>
+          <Eyebrow>AI COMPANY MATCHES</Eyebrow>
+          <h2>Companies ranked for your profile</h2>
+        </div>
+      </div>
+
+      <div className="company-grid">
+
+        {matches.map(company => (
+
+          <div
+            key={company.company}
+            className="company-card"
+          >
+
+            <div className="company-head">
+              <strong>{company.company}</strong>
+              <b>{company.score}%</b>
+            </div>
+
+            <div className="matchbar">
+              <i style={{ width: `${company.score}%` }} />
+            </div>
+
+            <p>
+              <strong>Tier:</strong> {company.tier}
+            </p>
+
+            <p>
+              <strong>Summary:</strong> {company.summary}
+            </p>
+
+            <div className="have-missing">
+              <div>
+                <small>Missing Skills</small>
+
+                <span>
+                  {company.missingSkills.join(" • ") || "No critical gaps found"}
+                </span>
+              </div>
+            </div>
+
+            {company.nextSteps.length > 0 && <p><strong>Next step:</strong> {company.nextSteps[0]}</p>}
+
+            <button
+              className="text-btn"
+              onClick={() => setSection("Roadmap")}
+            >
+              Improve Match
+            </button>
+
+          </div>
+
+        ))}
+
+      </div>
+    </Card>
+  )
+}
 function Applications({apps,stage}){return <div className="content-grid"><Card className="large-card"><div className="card-head"><div><Eyebrow>APPLICATION TRACKER</Eyebrow><h2>Your placement pipeline.</h2></div><button className="primary-btn"><Plus size={14}/> Add application</button></div>{apps.map((a,i)=><div className="application-row" key={a.company}><div className="company-logo small">{a.company[0]}</div><div><strong>{a.company}</strong><small>{a.role} · {a.date}</small></div><select value={a.stage} onChange={e=>stage(i,e.target.value)}><option>Applied</option><option>Screening</option><option>Interview</option><option>Offer</option><option>Rejected</option></select><ChevronRight size={14}/></div>)}</Card><Card><Eyebrow>REJECTION INTELLIGENCE</Eyebrow><div className="rejection-number">4 / 5</div><p>recent rejections involve DSA or technical rounds.</p><div className="recommendation"><strong>Recommended action</strong><span>Add 3 DSA practice blocks to your roadmap.</span></div></Card></div>}
 function Interviews({profile}){
  const [questions,setQuestions]=useState(null),[index,setIndex]=useState(0),[phase,setPhase]=useState('ready'),[seconds,setSeconds]=useState(30),[transcript,setTranscript]=useState(''),[interim,setInterim]=useState(''),[evaluations,setEvaluations]=useState([]),[loading,setLoading]=useState(false),[evaluating,setEvaluating]=useState(false),[error,setError]=useState(''),[warnings,setWarnings]=useState(0),[warningMessage,setWarningMessage]=useState(''),[showWarning,setShowWarning]=useState(false),[faceCount,setFaceCount]=useState(0),[proctorStatus,setProctorStatus]=useState('Camera ready'),[finished,setFinished]=useState(false),[terminated,setTerminated]=useState(false),[listening,setListening]=useState(false)
@@ -274,5 +414,15 @@ function Interviews({profile}){
  if(finished){const average=(evaluations.reduce((sum,item)=>sum+(item.evaluation?.score||0),0)/Math.max(1,evaluations.length)).toFixed(1);return <Card className="proctor-page interview-result"><Eyebrow>MOCK INTERVIEW COMPLETE</Eyebrow><div className="feedback-score">{average}</div><h2>AI evaluation</h2>{evaluations.map(item=><div className="interview-feedback" key={item.question.id}><strong>{item.question.category} question · {item.evaluation?.score||0}/10</strong><p>{item.evaluation?.feedback}</p><small><b>Strengths:</b> {(item.evaluation?.strengths||[]).join(' · ')||'—'}<br/><b>Improve:</b> {item.evaluation?.improvement}</small></div>)}<button className="primary-btn" onClick={()=>{setFinished(false);setQuestions(null);setPhase('ready')}}>Start another mock</button></Card>}
  return <div className="proctor-layout"><section className="proctor-main"><div className="proctor-title"><div><Eyebrow>AI MOCK INTERVIEW</Eyebrow><h2>{question?`Question ${index+1} of ${questions.length}`:'Technical interview workspace'}</h2></div>{active&&<span className={`proctor-timer ${phase}`}>{phase==='thinking'?'🧠':'⏱'} {String(Math.floor(seconds/60)).padStart(2,'0')}:{String(seconds%60).padStart(2,'0')}</span>}</div>{error&&<div className="parse-toast parse-toast--error">{error}</div>}{!question?<div className="mock-start"><div className="next-icon"><Video size={17}/></div><h2>Ready for your interview?</h2><p>Your camera and microphone are required. You will get 30 seconds to think and two minutes to answer each personalized question.</p><button className="primary-btn" disabled={loading} onClick={start}><Video size={14}/>{loading?'Preparing secure session…':'Start interview'}</button></div>:<><article className="proctor-question"><span className="status-chip purple">{question.category} question</span><h2>{question.question}</h2><p>{phase==='thinking'?'Use this time to structure your response. Your microphone starts with the answer phase.':'Speak naturally; your response is transcribed below. You may edit it before submitting.'}</p></article><section className="proctor-answer"><div><h3>Your answer</h3><span className={listening?'mic-live':''}>{listening?'● Microphone listening':'○ Microphone off'}</span></div><textarea value={transcript} onChange={event=>{transcriptRef.current=event.target.value;setTranscript(event.target.value)}} disabled={phase==='thinking'} placeholder={phase==='thinking'?'Think through your answer…':'Your spoken response will appear here. You can also type.'}/>{interim&&<p className="interim-text">{interim}</p>}<button className="primary-btn" disabled={phase==='thinking'||evaluating} onClick={submitAnswer}>{evaluating?'AI is evaluating…':index===questions.length-1?'Finish interview':'Next question'} <ArrowUpRight size={14}/></button></section></>}</section><aside className="proctor-side"><section className="camera-card"><div className="camera-head"><div><strong>Camera</strong><small>{proctorStatus}</small></div>{active&&<span>● LIVE</span>}</div><div className="camera-view"><video ref={videoRef} autoPlay muted playsInline/>{!active&&<div>🎥<br/><small>Camera preview starts when you begin.</small></div>}</div></section><section className="integrity-card"><Eyebrow>INTERVIEW INTEGRITY</Eyebrow><h3>Automated proctoring</h3><div className="integrity-row"><span>Warnings</span><b>{warnings} / 3</b></div><div className="integrity-row"><span>Face detection</span><b>{faceCount===1?'✓ Single candidate':faceCount>1?'! Multiple faces':'— Waiting'}</b></div><div className="integrity-row"><span>Browser activity</span><b>{active?'● Monitoring':'Ready'}</b></div><small>Leaving the tab, an absent face, or multiple faces creates a warning.</small></section><section className="interview-format"><Eyebrow>FORMAT</Eyebrow><p>2 personalized questions</p><p>30 sec thinking · 2 min answer</p><p>Camera + microphone required</p></section></aside>{showWarning&&<div className="warning-overlay"><div className="warning-modal"><b>WARNING {warnings} OF 3</b><h2>Interview integrity notice</h2><p>{warningMessage}</p><button className="primary-btn" onClick={()=>setShowWarning(false)}>I understand</button></div></div>}</div>
 }
-function Analytics(){const points='0,140 90,126 180,118 270,92 360,84 450,64 540,46 630,35';return <><Card className="analytics-card"><div className="card-head"><div><Eyebrow>CAREER TWIN TREND</Eyebrow><h2>Readiness over time</h2></div><span className="trend"><TrendingUp size={14}/> +12% this month</span></div><div className="chart"><svg viewBox="0 0 630 160" preserveAspectRatio="none"><polyline points={points} fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round"/></svg><div className="chart-labels"><span>Jul 1</span><span>Jul 15</span><span>Aug 1</span><span>Aug 21</span></div></div></Card><div className="content-grid"><Card><Eyebrow>REJECTION INTELLIGENCE</Eyebrow><div className="rejection-number">DSA</div><p>4 of your last 5 rejections included a DSA-heavy round.</p><div className="recommendation"><strong>Next move</strong><span>Prioritize timed DSA practice before your next interview.</span></div></Card><Card><div className="card-head"><div><Eyebrow>ROLE VIEW</Eyebrow><h2>Student analytics</h2></div><span className="status-chip green"><Users size={12}/> Cohort ready</span></div><div className="cohort"><Metric label="Avg readiness" value="74" suffix="%"/><Metric label="Skill gap" value="3.2" suffix=" avg"/><Metric label="Placement" value="68" suffix="%"/></div></Card></div></>}
+const GENERAL_RESOURCES = [
+ {title:'NeetCode practice',topic:'DSA',note:'Structured coding patterns and interview problem practice.',url:'https://neetcode.io/practice'},
+ {title:'Striver’s A2Z DSA Sheet',topic:'DSA',note:'Topic-by-topic DSA learning and problem sheet.',url:'https://takeuforward.org/strivers-a2z-dsa-course/strivers-a2z-dsa-course-sheet-2/'},
+ {title:'LeetCode problem set',topic:'Practice',note:'Solve and filter coding questions by topic and difficulty.',url:'https://leetcode.com/problemset/'},
+ {title:'System Design Primer',topic:'System Design',note:'Open-source guide to scalable system design concepts and interviews.',url:'https://github.com/donnemartin/system-design-primer'},
+ {title:'Full Stack Open',topic:'Fullstack',note:'Free University of Helsinki course for React, Node, APIs, databases and TypeScript.',url:'https://fullstackopen.com/en/'},
+ {title:'GeeksforGeeks CS Core Subjects',topic:'CS Fundamentals',note:'Reference material for operating systems, networks, DBMS and OOP.',url:'https://www.geeksforgeeks.org/computer-science-subjects/'},
+ {title:'IndiaBIX aptitude',topic:'Aptitude',note:'Quantitative and logical-reasoning practice questions.',url:'https://www.indiabix.com/'},
+]
+function Resources(){return <><Card><Eyebrow>STUDY LIBRARY</Eyebrow><h2>General interview-prep resources</h2><p>These direct links are separate from your roadmap. Open any resource whenever you want—no AI request is made.</p></Card><div className="resource-library">{GENERAL_RESOURCES.map(resource=><a key={resource.title} href={resource.url} target="_blank" rel="noreferrer"><span>{resource.topic}</span><b>{resource.title}</b><p>{resource.note}</p><small>Open website <ArrowUpRight size={12}/></small></a>)}</div></>}
+function Analytics({profile}){const username=githubUsername(profile?.github||'');const [data,setData]=useState(null),[loading,setLoading]=useState(false),[error,setError]=useState('');const fetchedUsername=useRef('');const load=useCallback(async(force=false)=>{if(!username||(!force&&fetchedUsername.current===username))return;fetchedUsername.current=username;setLoading(true);setError('');try{setData(await fetchGithubAnalytics(username))}catch(err){setData(null);setError(err.message)}finally{setLoading(false)}},[username]);useEffect(()=>{load()},[load]);if(!username)return <Card><Eyebrow>GITHUB ANALYTICS</Eyebrow><h2>Add your GitHub profile first</h2><p>Use Update resume to add a public GitHub URL, then return here to see repositories, branches, recent public commits and open-source activity.</p></Card>;return <><Card className="github-hero"><div className="card-head"><div><Eyebrow>GITHUB ANALYTICS</Eyebrow><h2>{data?.account?.name||username}</h2><p>{data?.account?.bio||'Loading public GitHub profile…'}</p></div><button className="ghost-btn" onClick={()=>load(true)} disabled={loading}>{loading?'Loading…':'Refresh'}</button></div>{error&&<p className="resource-error">{error}</p>}{data&&<><div className="github-profile"><img src={data.account.avatar} alt="GitHub profile"/><a href={data.account.profileUrl} target="_blank" rel="noreferrer">@{data.account.login} <ArrowUpRight size={13}/></a></div><div className="metrics github-metrics"><Metric label="Public repos" value={data.stats.repositories} suffix=""/><Metric label="Recent public commits" value={data.stats.recentCommits} suffix=""/><Metric label="Branches scanned" value={data.stats.branches} suffix=""/><Metric label="Open-source activity" value={data.stats.openSourceActivity} suffix=""/></div><p className="github-note">Branches are counted across the {data.stats.scannedRepositories} most recently updated public repositories. Commit and contribution activity reflects GitHub’s recent public activity feed.</p></>}</Card>{data&&<Card><div className="card-head"><div><Eyebrow>PUBLIC REPOSITORIES</Eyebrow><h2>Projects and descriptions</h2></div><span className="status-chip blue"><GitBranch size={12}/> Public data</span></div><div className="github-repos">{data.repositories.map(repo=><a href={repo.url} target="_blank" rel="noreferrer" key={repo.url}><b>{repo.name}</b><p>{repo.description}</p><span>{repo.language} · ★ {repo.stars} · Forks {repo.forks}</span></a>)}</div></Card>}</>}
 export default App
