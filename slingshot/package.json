@@ -10,6 +10,7 @@
   },
   "dependencies": {
     "@mediapipe/tasks-vision": "^1.0.1",
+    "@monaco-editor/react": "^4.7.0",
     "@supabase/supabase-js": "^2.112.3",
     "@vitejs/plugin-react": "latest",
     "@xyflow/react": "^12.11.3",

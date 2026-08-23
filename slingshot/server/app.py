@@ -23,6 +23,8 @@ OPENROUTER_URL = 'https://openrouter.ai/api/v1/chat/completions'
 MODEL = 'qwen/qwen3-30b-a3b'
 RESOURCE_CACHE = {}
 GITHUB_CACHE = {}
+CODEFORCES_CACHE = {'created_at': 0, 'data': []}
+QUESTION_BANK_PATH = Path(__file__).resolve().parent / 'question_bank.json'
 
 
 @app.get('/api/health')
@@ -32,6 +34,100 @@ def health_check():
         version='readiness-v2',
         openrouterConfigured=bool(os.getenv('OPENROUTER_API_KEY')),
     )
+
+
+def load_question_bank():
+    with QUESTION_BANK_PATH.open(encoding='utf-8') as file:
+        return json.load(file)
+
+
+@app.get('/api/questions')
+def list_questions():
+    difficulty = request.args.get('difficulty', '').strip().lower()
+    source = request.args.get('source', 'bank').strip().lower()
+    if source not in ('bank', 'my-bank', 'local'):
+        return jsonify(error='Use source=bank for local practice questions.'), 400
+    questions = load_question_bank()
+    if difficulty in ('easy', 'medium', 'hard'):
+        questions = [question for question in questions if question.get('difficulty', '').lower() == difficulty]
+    return jsonify(questions=questions)
+
+
+@app.get('/api/codeforces-problems')
+def codeforces_problems():
+    difficulty = request.args.get('difficulty', '').strip().lower()
+    try:
+        if time.time() - CODEFORCES_CACHE['created_at'] > 86400 or not CODEFORCES_CACHE['data']:
+            response = requests.get('https://codeforces.com/api/problemset.problems', timeout=30)
+            response.raise_for_status()
+            payload = response.json()
+            if payload.get('status') != 'OK':
+                raise ValueError('Codeforces did not return its problem set.')
+            items = []
+            for problem in payload.get('result', {}).get('problems', []):
+                rating = problem.get('rating')
+                if not isinstance(rating, int) or not problem.get('contestId') or not problem.get('index'):
+                    continue
+                mapped = 'Easy' if rating < 1200 else 'Medium' if rating <= 1900 else 'Hard'
+                items.append({'id': f"cf-{problem['contestId']}-{problem['index']}", 'title': problem.get('name', 'Untitled'), 'difficulty': mapped, 'topic': ' · '.join(problem.get('tags', [])[:3]) or 'Codeforces', 'rating': rating, 'source': 'Codeforces', 'url': f"https://codeforces.com/problemset/problem/{problem['contestId']}/{problem['index']}"})
+            CODEFORCES_CACHE.update(created_at=time.time(), data=items)
+        data = CODEFORCES_CACHE['data']
+        if difficulty in ('easy', 'medium', 'hard'):
+            data = [item for item in data if item['difficulty'].lower() == difficulty]
+        return jsonify(problems=data[:150], cached=True)
+    except (requests.RequestException, ValueError):
+        return jsonify(error='Codeforces problems are unavailable right now. Please try again later.'), 502
+
+
+@app.post('/api/run-code')
+def run_code():
+    body = request.get_json(silent=True) or {}
+    language = body.get('language')
+    code = body.get('code')
+    question_id = body.get('question_id')
+    if language not in ('python', 'javascript') or not isinstance(code, str) or not isinstance(question_id, str):
+        return jsonify(error='A supported language, code, and local question id are required.'), 400
+    question = next((item for item in load_question_bank() if item.get('id') == question_id), None)
+    if not question:
+        return jsonify(error='Code can be run only against a question from My Bank.'), 400
+    runtime = {'python': {'language': 'python', 'version': '3.10.0'}, 'javascript': {'language': 'javascript', 'version': '18.15.0'}}[language]
+    outcomes = []
+    try:
+        for case in question.get('testCases', []):
+            response = requests.post('https://emkc.org/api/v2/piston/execute', json={**runtime, 'files': [{'name': 'main.py' if language == 'python' else 'main.js', 'content': code}], 'stdin': case['input']}, timeout=20)
+            response.raise_for_status()
+            result = response.json().get('run', {})
+            output = (result.get('stdout') or '').strip()
+            expected = str(case.get('expected', '')).strip()
+            outcomes.append({'input': case['input'], 'expected': expected, 'output': output, 'passed': output.lower() == expected.lower(), 'stderr': (result.get('stderr') or '').strip(), 'code': result.get('code'), 'signal': result.get('signal')})
+        return jsonify(results=outcomes, passed=sum(1 for item in outcomes if item['passed']), total=len(outcomes))
+    except requests.RequestException:
+        return jsonify(error='The Piston execution service is unavailable. Please try again shortly.'), 503
+
+
+@app.post('/api/debug-help')
+def debug_help():
+    body = request.get_json(silent=True) or {}
+    question, code, output, full_fix = body.get('question'), body.get('code'), body.get('output', ''), body.get('full_fix', False)
+    if not isinstance(question, dict) or not isinstance(code, str) or not code.strip():
+        return jsonify(error='Question and code are required for debugging help.'), 400
+    prompt = f'''Question: {question.get('title')}\nDescription: {question.get('description')}\nCode:\n{code[:10000]}\nError or failed output:\n{str(output)[:3000]}\n\nGive {'a complete corrected solution with explanation' if full_fix else 'a hint-first explanation of the likely bug. Do not give full replacement code; give the smallest next step to try.'} Return plain text.'''
+    ollama_url = os.getenv('OLLAMA_URL', 'http://localhost:11434')
+    try:
+        response = requests.post(f'{ollama_url.rstrip("/")}/api/generate', json={'model': os.getenv('OLLAMA_MODEL', 'llama3.2'), 'prompt': prompt, 'stream': False}, timeout=90)
+        if response.ok:
+            return jsonify(reply=response.json().get('response', '').strip(), provider='ollama')
+    except requests.RequestException:
+        pass
+    groq_key = os.getenv('GROQ_API_KEY')
+    if not groq_key:
+        return jsonify(error='Debug help needs local Ollama running, or a free GROQ_API_KEY configured on the server.'), 503
+    try:
+        response = requests.post('https://api.groq.com/openai/v1/chat/completions', headers={'Authorization': f'Bearer {groq_key}', 'Content-Type': 'application/json'}, json={'model': os.getenv('GROQ_MODEL', 'llama-3.3-70b-versatile'), 'messages': [{'role': 'system', 'content': 'You are a concise programming mentor. Prefer hints over full solutions unless explicitly asked.'}, {'role': 'user', 'content': prompt}], 'temperature': .2}, timeout=45)
+        response.raise_for_status()
+        return jsonify(reply=response.json()['choices'][0]['message']['content'].strip(), provider='groq')
+    except (requests.RequestException, KeyError, IndexError, TypeError):
+        return jsonify(error='Debug help is temporarily unavailable.'), 503
 
 
 def github_request(path):
@@ -165,6 +261,39 @@ def openrouter_json(system_prompt, user_prompt, temperature=0.3):
         return json.loads(content.replace('```json', '').replace('```', '').strip())
     except (KeyError, IndexError, TypeError, json.JSONDecodeError) as error:
         raise ValueError(f'Model returned invalid JSON: {error}') from error
+
+
+@app.post('/api/ats/check')
+def ats_check():
+    body = request.get_json(silent=True) or {}
+    profile = body.get('profile')
+    job_description = body.get('job_description', '')
+    if not isinstance(profile, dict):
+        return jsonify(error='A saved resume profile is required.'), 400
+    if not isinstance(job_description, str):
+        return jsonify(error='Job description must be text.'), 400
+    prompt = f'''Analyze this structured resume profile for Applicant Tracking System (ATS) readiness. Do not claim you inspected formatting, page count, fonts, or content not present in the profile.
+
+RESUME PROFILE:
+{json.dumps(profile, indent=2)}
+
+TARGET JOB DESCRIPTION (optional):
+{job_description[:12000] or 'No job description supplied. Assess general ATS readiness for the target role in the profile.'}
+
+Return only valid JSON exactly in this shape:
+{{"score":0,"summary":"string","section_scores":[{{"name":"Contact details|Target role|Skills|Projects / experience|Education|Keywords","score":0,"note":"string"}}],"matched_keywords":["string"],"missing_keywords":["string"],"strengths":["string"],"improvements":[{{"priority":"high|medium|low","title":"string","detail":"string"}}]}}
+
+Score 0-100 must reflect only the given information. List at most 8 matched and 8 missing keywords. Give 3-6 specific improvements. If no job description is supplied, describe target-role keywords to add only when genuinely absent.'''
+    try:
+        result = openrouter_json('You are a precise ATS resume reviewer. Return valid JSON only. Never invent experience or achievements.', prompt, 0.15)
+        if not isinstance(result, dict) or not isinstance(result.get('score'), (int, float)) or not isinstance(result.get('improvements'), list):
+            raise ValueError('ATS checker returned an invalid analysis.')
+        result['score'] = max(0, min(100, round(result['score'])))
+        return jsonify(result)
+    except (ValueError, KeyError, TypeError, json.JSONDecodeError) as error:
+        return jsonify(error=str(error)), 502
+    except requests.RequestException:
+        return jsonify(error='ATS checker is temporarily unavailable. Please try again shortly.'), 503
 
 
 @app.post('/api/tars/chat')
@@ -439,11 +568,51 @@ def curate_resources(topic, level):
 
 
 def analyze_readiness(activity):
-    prompt = f'''You are an interview-readiness analyst. Produce an honest evidence-based assessment strictly from this activity JSON. Mock interviews have the most weight. Do not inflate scores, and say confidence is low if activity is thin. Return only JSON exactly with overall_readiness_pct (0-100), confidence (low|medium|high), tracks ([{{name,completion_pct,verified_score_pct,status}}]), weak_areas ([{{topic,evidence}}]), next_actions (3-5 concrete actions), and trend ({{direction,note}}).\n\nACTIVITY:\n{json.dumps(activity, indent=2)}'''
-    result = openrouter_json('You give deterministic, data-grounded readiness assessments. Return JSON only.', prompt, 0.1)
-    if not isinstance(result, dict) or not isinstance(result.get('tracks'), list):
-        raise ValueError('Readiness analysis was invalid.')
-    return result
+    # Deterministic by design: resume claims and model guesses never raise readiness.
+    roadmap = activity.get('roadmap_progress', {}) if isinstance(activity.get('roadmap_progress'), dict) else {}
+    roadmap_tracks = roadmap.get('tracks', {}) if isinstance(roadmap.get('tracks'), dict) else {}
+    verification = activity.get('skill_verification', {}) if isinstance(activity.get('skill_verification'), dict) else {}
+    evidence = [item for item in verification.get('quizzes_taken', []) + verification.get('coding_tests_taken', []) if isinstance(item, dict) and isinstance(item.get('score_pct'), (int, float))]
+    mocks = [item for item in activity.get('mock_interviews', []) if isinstance(item, dict) and isinstance(item.get('score_pct'), (int, float))]
+    verified_scores = [max(0, min(100, item['score_pct'])) for item in evidence]
+    mock_scores = [max(0, min(100, item['score_pct'])) for item in mocks]
+    total = roadmap.get('phases_total', 0)
+    completed = roadmap.get('phases_completed', 0)
+    roadmap_pct = round(max(0, min(100, completed / total * 100))) if isinstance(total, (int, float)) and total > 0 and isinstance(completed, (int, float)) else 0
+    verification_avg = sum(verified_scores) / len(verified_scores) if verified_scores else 0
+    mock_avg = sum(mock_scores) / len(mock_scores) if mock_scores else 0
+    overall = round(roadmap_pct * .25 + verification_avg * .30 + mock_avg * .45)
+    confidence = 'high' if len(mock_scores) >= 3 and len(verified_scores) >= 3 else 'medium' if mock_scores and len(verified_scores) >= 2 else 'low'
+    aliases = {'DSA': ('dsa', 'algorithm', 'array', 'tree', 'graph', 'leetcode'), 'CN': ('cn', 'network', 'tcp', 'http'), 'OS': ('os', 'operating system', 'deadlock'), 'System Design': ('system design', 'lld', 'hld', 'design'), 'Fullstack': ('fullstack', 'frontend', 'backend', 'react', 'node'), 'Aptitude': ('aptitude', 'quant', 'reasoning')}
+    tracks = []
+    for name, terms in aliases.items():
+        raw = roadmap_tracks.get(name, {}) if isinstance(roadmap_tracks.get(name), dict) else {}
+        completion = raw.get('completion_pct', 0)
+        if name == 'DSA' and isinstance(raw.get('target'), (int, float)) and raw['target'] > 0:
+            completion = raw.get('problems_solved', 0) / raw['target'] * 100
+        completion = round(max(0, min(100, completion))) if isinstance(completion, (int, float)) else 0
+        related = [item['score_pct'] for item in evidence if any(term in str(item.get('topic', '')).lower() for term in terms)]
+        verified = round(sum(related) / len(related)) if related else None
+        status = 'not started' if completion == 0 and verified is None else ('on track' if completion >= 60 and (verified is None or verified >= 70) else 'needs work')
+        tracks.append({'name': name, 'completion_pct': completion, 'verified_score_pct': verified, 'status': status})
+    weak_areas = [{'topic': str(item.get('topic', 'Skill verification')), 'evidence': f"Verified score: {round(item['score_pct'])}%. Target 70% or higher."} for item in evidence if item['score_pct'] < 70]
+    for mock in mocks:
+        for weakness in mock.get('flagged_weaknesses', []) if isinstance(mock.get('flagged_weaknesses'), list) else []:
+            weak_areas.append({'topic': str(weakness), 'evidence': 'Flagged during a recorded mock interview.'})
+    if not weak_areas and not evidence:
+        weak_areas = [{'topic': 'Insufficient evidence', 'evidence': 'No quiz, coding test, roadmap completion, or mock interview has been recorded.'}]
+    actions = []
+    if not evidence: actions.append('Complete at least two skill quizzes to establish a verified baseline.')
+    if not mock_scores: actions.append('Take a mock interview; interview performance has the highest readiness weight.')
+    if not total: actions.append('Generate a roadmap and record completed phases to measure preparation progress.')
+    actions += [f"Retake or practise {item['topic']} until your verified score is at least 70%." for item in weak_areas if item['topic'] != 'Insufficient evidence']
+    while len(actions) < 3: actions.append('Log completed roadmap work so the score reflects real preparation.')
+    recent = mock_scores[-3:]
+    if len(recent) < 2: trend = {'direction': 'insufficient_data', 'note': 'Complete at least two mock interviews to measure a performance trend.'}
+    elif recent[-1] > recent[0] + 4: trend = {'direction': 'improving', 'note': f'Mock score moved from {round(recent[0])}% to {round(recent[-1])}%.'}
+    elif recent[-1] < recent[0] - 4: trend = {'direction': 'declining', 'note': f'Mock score moved from {round(recent[0])}% to {round(recent[-1])}%.'}
+    else: trend = {'direction': 'plateauing', 'note': 'Recent mock interview scores are broadly unchanged.'}
+    return {'overall_readiness_pct': overall, 'confidence': confidence, 'tracks': tracks, 'weak_areas': weak_areas[:6], 'next_actions': actions[:5], 'trend': trend}
 
 
 @app.post('/api/roadmaps/generate')
